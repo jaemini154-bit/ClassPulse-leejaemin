@@ -76,10 +76,16 @@ public final class OnlineSessionFragment extends OnlineFragment {
                     "반응한 학생",
                     String.valueOf(stats.optInt("uniqueReactingStudents")));
             JSONObject counts = stats.optJSONObject("eventCountsByType");
+            // 반응 유형별 건수를 막대로 비교한다. 가장 많은 유형이 막대 100%.
+            int most = 0;
             for (int i = 0; i < 4; i++)
-                ui.text(
+                most = Math.max(most, counts == null ? 0 : counts.optInt(TYPES[i]));
+            for (int i = 0; i < 4; i++)
+                ui.meter(
                         shell.content,
-                        LABELS[i] + " · " + (counts == null ? 0 : counts.optInt(TYPES[i])));
+                        LABELS[i],
+                        counts == null ? 0 : counts.optInt(TYPES[i]),
+                        most);
             ui.button(
                     shell.content,
                     s.optBoolean("questionsOpen") ? "질문 접수 마감" : "질문 접수 다시 열기",
