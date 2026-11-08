@@ -69,6 +69,7 @@ public final class OnlineSessionFragment extends OnlineFragment {
                                         .show());
             }
             JSONObject stats = item("STATS", "summary");
+            ui.section(shell.content, "학생 반응", "반응은 익명으로 집계돼요.");
             ui.stats(
                     shell.content,
                     "참여 학생",
@@ -129,7 +130,7 @@ public final class OnlineSessionFragment extends OnlineFragment {
                                 v -> repo.saveMark(screen.lessonId, t, v, callback(x -> {})));
                     });
             if ("LIVE".equals(s.optString("status")) && !p.isNull("currentVisitId")) {
-                ui.heading(shell.content, "지금 수업은 어떤가요?", "반응은 교수에게 익명 집계로 전달돼요.");
+                ui.section(shell.content, "지금 수업은 어떤가요?", "반응은 교수에게 익명 집계로 전달돼요.");
                 for (int row = 0; row < 2; row++) {
                     int a = row * 2, b = a + 1;
                     ui.pair(
@@ -141,7 +142,7 @@ public final class OnlineSessionFragment extends OnlineFragment {
                 }
             }
         }
-        ui.heading(shell.content, "수업 대주제", null);
+        ui.section(shell.content, "수업 대주제", null);
         for (OnlineDatabase.Document d : topics()) {
             boolean complete = OnlineJson.contains(p.optJSONArray("completedTopicIds"), d.id),
                     selected = d.id.equals(p.optString("currentTopicId"));
@@ -154,7 +155,7 @@ public final class OnlineSessionFragment extends OnlineFragment {
                             ? () -> progress("REVISIT", d.id)
                             : null);
         }
-        ui.heading(shell.content, teacher ? "접수된 질문" : "내 질문", null);
+        ui.section(shell.content, teacher ? "접수된 질문" : "내 질문", null);
         for (OnlineDatabase.Document d : kind("QUESTION")) {
             JSONObject q = OnlineJson.object(d.json);
             ui.card(
@@ -190,7 +191,7 @@ public final class OnlineSessionFragment extends OnlineFragment {
                                             screen.withQuestion(OnlineJson.id())
                                                     .withTopic(d.topicId)));
         }
-        ui.heading(shell.content, "함께 보는 공개 Q&A", null);
+        ui.section(shell.content, "함께 보는 공개 Q&A", null);
         for (OnlineDatabase.Document d : kind("PUBLIC_QNA")) {
             JSONObject q = OnlineJson.object(d.json);
             ui.card(
