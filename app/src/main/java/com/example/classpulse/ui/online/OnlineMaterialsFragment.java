@@ -118,11 +118,14 @@ public final class OnlineMaterialsFragment extends OnlineLearningPage {
         boolean teacher = owner();
         shell.roleLabel.setText(teacher ? "교수자" : "학생");
         String section = section();
+        // 교수자는 단계별로 나눈다: "" = 1단계 녹음·원문 검토, "summary" = 2단계 요약·보충 설명
         boolean wantTranscript = !"summary".equals(section);
-        boolean wantNotes = !"transcript".equals(section);
+        boolean wantNotes = teacher ? "summary".equals(section) : !"transcript".equals(section);
         ui.heading(shell.content, lesson.optString("title"),
                 "transcript".equals(section) ? "수업 처음부터 끝까지, 구간별 전체 원문"
-                        : "summary".equals(section) ? "대주제별 요약과 교수 보충 설명"
+                        : "summary".equals(section)
+                                ? (teacher ? "2단계 · 대주제별 요약과 보충 설명 작성" : "대주제별 요약과 교수 보충 설명")
+                        : teacher ? "1단계 · 녹음을 원문으로 바꾸고 검토해 공개해요"
                         : "수업 원문 · 대주제별 요약 · 보충 설명");
         if (teacher && section.isEmpty()) showRecording(lesson.optString("status"));
         ui.button(shell.content, loading ? "자료 불러오는 중…" : "자료 상태 새로고침", false, this::reload)
@@ -141,9 +144,17 @@ public final class OnlineMaterialsFragment extends OnlineLearningPage {
             }
         }
         if (wantNotes) showNotes(teacher, content.optJSONArray("notes"));
+        if (teacher) {
+            // 한 화면에 다 넣지 않고, 다음 단계 화면으로 넘어가는 버튼만 둔다
+            if ("summary".equals(section))
+                ui.button(shell.content, "다음 단계: 복습 퀴즈 만들기", true, () -> open("online_quizzes"));
+            else if (content.optJSONObject("published") != null)
+                ui.button(shell.content, "다음 단계: 요약·보충 설명 작성", true, () -> open("online_summary"));
+            return;
+        }
         if ("transcript".equals(section))
             ui.button(shell.content, "요약·보충 설명 보기", false, () -> open("online_summary"));
-        else if ("summary".equals(section) && !teacher)
+        else if ("summary".equals(section))
             ui.button(shell.content, "전체 원문 보기", false, () -> open("online_transcript"));
         ui.button(shell.content, "복습 퀴즈", false, () -> open("online_quizzes"));
     }
@@ -301,7 +312,14 @@ public final class OnlineMaterialsFragment extends OnlineLearningPage {
                 .setTitle("검토한 전체 원문을 공개할까요?")
                 .setMessage("참여 학생이 종료된 수업에서 이 버전의 원문을 볼 수 있어요.")
                 .setNegativeButton("취소", null)
-                .setPositiveButton("공개", (dialog, button) -> request("publishLecture", value -> reload(),
+                .setPositiveButton("공개", (dialog, button) -> request("publishLecture", value -> {
+                            reload();
+                            if (shell == null) return;
+                            android.widget.Toast.makeText(requireContext(),
+                                    "원문을 공개했어요. 이제 대주제별 요약·보충 설명을 작성해요.",
+                                    android.widget.Toast.LENGTH_SHORT).show();
+                            open("online_summary");
+                        },
                         "operationId", OnlineJson.id(), "baseRevision", material.optLong("revision")))
                 .show()).setEnabled(!sending);
     }
@@ -336,18 +354,37 @@ public final class OnlineMaterialsFragment extends OnlineLearningPage {
             ui.button(shell.content, "대주제 자료 편집", false, () -> chooseTopic(false, id -> editNote(id, notes)))
                     .setEnabled(!sending);
         }
-        if (notes == null || notes.length() == 0) ui.note(shell.content, "등록된 대주제 자료가 없어요.");
-        else for (int i = 0; i < notes.length(); i++) {
+        if (notes == null || notes.length() == 0) {
+            ui.note(shell.content, teacher ? "등록된 대주제 자료가 없어요." : "교수님이 공개한 요약·보충 설명이 아직 없어요.");
+            return;
+        }
+        // 목차 순서대로 보여 준다
+        java.util.List<JSONObject> ordered = new java.util.ArrayList<>();
+        for (int i = 0; i < notes.length(); i++) {
             JSONObject note = notes.optJSONObject(i);
-            if (note == null) continue;
+            if (note != null) ordered.add(note);
+        }
+        java.util.Map<String, Integer> order = new java.util.HashMap<>();
+        java.util.List<com.example.classpulse.online.OnlineDatabase.Document> outline = topics();
+        for (int i = 0; i < outline.size(); i++) order.put(outline.get(i).id, i);
+        ordered.sort((a, b) -> Integer.compare(
+                order.getOrDefault(a.optString("topicId"), Integer.MAX_VALUE),
+                order.getOrDefault(b.optString("topicId"), Integer.MAX_VALUE)));
+        for (JSONObject note : ordered) {
             String topic = topicTitle(note.optString("topicId"));
-            ui.button(shell.content, topic + (teacher ? " 자료 편집" : " 요약·보충 설명"), false,
-                    () -> {
-                        if (teacher) editNote(note.optString("topicId"), notes);
-                        else new MaterialAlertDialogBuilder(requireContext()).setTitle(topic)
-                                .setMessage("요약\n" + note.optString("summary") + "\n\n보충 설명\n" + note.optString("supplement"))
-                                .setPositiveButton("닫기", null).show();
-                    }).setEnabled(!sending);
+            if (teacher) {
+                ui.button(shell.content, topic + " 자료 편집", false,
+                        () -> editNote(note.optString("topicId"), notes)).setEnabled(!sending);
+                continue;
+            }
+            // 학생: 팝업 대신 화면에 바로 글로 보여 준다
+            String summary = note.optString("summary").trim();
+            String supplement = note.optString("supplement").trim();
+            ui.section(shell.content, topic, null);
+            if (!summary.isEmpty()) ui.text(shell.content, "요약\n" + summary);
+            if (!supplement.isEmpty()) ui.note(shell.content, "교수 보충 설명\n" + supplement);
+            if (summary.isEmpty() && supplement.isEmpty())
+                ui.note(shell.content, "이 대주제의 자료가 아직 비어 있어요.");
         }
     }
 
