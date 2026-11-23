@@ -155,21 +155,9 @@ public final class OnlineSessionFragment extends OnlineFragment {
                                     "online_question_edit",
                                     screen.withQuestion(OnlineJson.id())
                                             .withTopic(currentTopic)));
-            ui.button(
-                    shell.content,
-                    "질문할 순간 표시",
-                    false,
-                    () -> {
-                        if (currentTopic.isEmpty()) {
-                            error("수업이 진행 중일 때 현재 주제를 표시할 수 있어요.");
-                            return;
-                        }
-                        ui.prompt(
-                                "개인 키워드",
-                                "",
-                                false,
-                                v -> repo.saveMark(screen.lessonId, currentTopic, v, callback(x -> {})));
-                    });
+            // QA 9: '질문할 순간 표시' 버튼은 질문 작성 화면의 '개인 초안 저장'과 역할이 겹쳐 제거했다.
+            // 예전에 저장된 개인 표시는 아래 목록과 내 기록에서 계속 보인다.
+            ui.note(shell.content, "질문을 다 쓰지 못했다면 질문 화면에서 '개인 초안 저장'을 눌러 두고 나중에 이어서 써요.");
             if ("LIVE".equals(s.optString("status")) && !p.isNull("currentVisitId")
                     && !p.optString("currentVisitId").isEmpty()) {
                 boolean accepting = s.optBoolean("questionsOpen", true);
