@@ -135,7 +135,7 @@ public final class FirebaseOnlineTransport implements OnlineTransport {
                             out.completeExceptionally(failure(task.getException()));
                             return;
                         }
-                        if (!task.getResult().exists()) {
+                        if (!task.getResult().exists() || task.getResult().get(time) == null) {
                             out.completeExceptionally(
                                     new Failure("CURSOR_CHANGED", "목록을 새로 확인해 주세요."));
                             return;
@@ -147,8 +147,14 @@ public final class FirebaseOnlineTransport implements OnlineTransport {
 
     private void watch(
             Query query, String kind, Sink sink, List<ListenerRegistration> registrations) {
+        boolean personalState = "OWN_REACTION".equals(kind) || "QUESTION_DRAFT".equals(kind);
+        watch(query, kind, sink, registrations, personalState ? MetadataChanges.INCLUDE : MetadataChanges.EXCLUDE);
+    }
+
+    private void watch(Query query, String kind, Sink sink,
+                       List<ListenerRegistration> registrations, MetadataChanges metadataChanges) {
         registrations.add(
-                query.addSnapshotListener((snapshot, error) -> {
+                query.addSnapshotListener(metadataChanges, (snapshot, error) -> {
                     if (error != null) {
                         Failure f = failure(error);
                         sink.error(f.reason, f.getMessage());
@@ -228,6 +234,8 @@ public final class FirebaseOnlineTransport implements OnlineTransport {
                 "QUESTION",
                 sink,
                 all);
+        // Older cached questions can be withdrawn after they leave the first page.
+        watch(questions.whereEqualTo("status", "WITHDRAWN"), "QUESTION", sink, all, MetadataChanges.INCLUDE);
         watch(
                 db.collection(base + "/publicQna")
                         .orderBy("publishedAt", Query.Direction.DESCENDING)
@@ -252,7 +260,7 @@ public final class FirebaseOnlineTransport implements OnlineTransport {
                 all);
         watch(
                 db.collection(personal + "/reactionReceipts")
-                        .orderBy("createdAt", Query.Direction.DESCENDING)
+                        .orderBy("updatedAt", Query.Direction.DESCENDING)
                         .limit(100),
                 "OWN_REACTION",
                 sink,
@@ -260,6 +268,11 @@ public final class FirebaseOnlineTransport implements OnlineTransport {
         if (owner) {
             watch(db.collection(base + "/teacherDrafts"), "ANSWER_DRAFT", sink, all);
             watch(db.document(base + "/analytics/summary"), "STATS", sink, all);
+            watch(db.collection(base + "/analytics")
+                            .orderBy(FieldPath.documentId())
+                            .startAt("topic_")
+                            .endAt("topic_\uf8ff"),
+                    "STATS", sink, all);
         }
         return () -> {
             for (ListenerRegistration r : all) r.remove();

@@ -6,6 +6,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.appcompat.widget.PopupMenu;
 import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 import com.example.classpulse.R;
 import com.example.classpulse.domain.Models;
@@ -76,7 +77,7 @@ public class RecordsFragment extends BaseFragment {
                     count++;
                     ui.card(
                             content,
-                            StudentSupport.reaction(item.type),
+                            Ui.reactionLabel(item.type),
                             Ui.topicTitle(course, item.topicId) + " · " + Ui.time(item.createdAt),
                             "기록됨",
                             () -> {
@@ -118,9 +119,9 @@ public class RecordsFragment extends BaseFragment {
                     count++;
                     String badge =
                             StudentSupport.draft(q) ? "작성 중" : q.published ? "답변 공개됨" : "답변 대기";
-                    ui.card(
+                    View card = ui.card(
                             content,
-                            StudentSupport.safe(q.text).isEmpty() ? "작성 중인 질문" : q.text,
+                            q.text,
                             Ui.topicTitle(course, q.topicId) + " · " + Ui.time(q.createdAt),
                             badge,
                             () -> {
@@ -131,7 +132,8 @@ public class RecordsFragment extends BaseFragment {
                                         screen().forLesson(course.id)
                                                 .withQuestion(q.id)
                                                 .withTopic(q.topicId));
-                            });
+                            }, StudentSupport.draft(q) ? anchor -> draftMenu(course, q, anchor) : null);
+                    card.findViewById(R.id.cardMenu).setContentDescription("질문 초안 더보기: " + q.text);
                 }
             }
         }
@@ -140,10 +142,25 @@ public class RecordsFragment extends BaseFragment {
                     content,
                     reactions ? "아직 남긴 반응이 없어요" : "아직 개인 기록이 없어요",
                     reactions
-                            ? "수업 화면의 네 가지 반응으로 어려움을 전할 수 있어요."
+                            ? "수업 화면에서 지금의 이해 상태를 전할 수 있어요."
                             : "질문 표시나 작성 중인 질문은 이곳에서 이어서 볼 수 있어요.");
         ui.note(content, "개인 표시·초안은 나만 볼 수 있어요. 교수님이 접수한 질문과 공개된 답변을 구분해 표시해요.");
         ui.button(dock, "내 수업으로", true, () -> navigate("home"));
+    }
+
+    private void draftMenu(Models.Lesson course, Models.Question draft, View anchor) {
+        PopupMenu menu = new PopupMenu(requireContext(), anchor);
+        menu.getMenu().add("초안 삭제").setOnMenuItemClickListener(item -> {
+            new MaterialAlertDialogBuilder(requireContext())
+                    .setTitle("질문 초안을 삭제할까요?")
+                    .setMessage("작성 중인 내용이 내 기록에서 사라져요.")
+                    .setNegativeButton("취소", null)
+                    .setPositiveButton("삭제", (dialog, which) -> vm.repo.deleteQuestionDraft(
+                            course.id, draft.id, vm.userId(), callback(v -> {})))
+                    .show();
+            return true;
+        });
+        menu.show();
     }
 
     private void showMark(Models.Lesson course, Models.Mark mark) {
@@ -157,8 +174,12 @@ public class RecordsFragment extends BaseFragment {
                 .setNegativeButton("닫기", null)
                 .setPositiveButton(
                         "질문으로 이어 쓰기",
-                        (dialog, which) ->
-                                vm.repo.saveDraft(
+                        (dialog, which) -> {
+                            if (StudentSupport.safe(mark.keyword).trim().isEmpty()) {
+                                navigate("question_edit", screen().forLesson(course.id).withTopic(mark.topicId));
+                                return;
+                            }
+                            vm.repo.saveDraft(
                                         null,
                                         course.id,
                                         mark.topicId,
@@ -170,7 +191,8 @@ public class RecordsFragment extends BaseFragment {
                                                     screen().forLesson(course.id)
                                                             .withQuestion(id)
                                                             .withTopic(mark.topicId));
-                                        })))
+                                        }));
+                        })
                 .show();
     }
 

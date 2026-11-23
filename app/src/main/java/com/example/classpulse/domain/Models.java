@@ -1,6 +1,8 @@
 package com.example.classpulse.domain;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 /** Read-only UI snapshots. All changes go through LessonRepository. */
@@ -8,13 +10,17 @@ public final class Models {
     public static final String TEACHER_ID = "demo-teacher";
     public static final String STUDENT_ID = "demo-student";
     public static final String READY = "READY", LIVE = "LIVE", ENDED = "ENDED";
-    public static final String DRAFT = "DRAFT", SUBMITTED = "SUBMITTED", ANSWERED = "ANSWERED";
+    public static final String DRAFT = "DRAFT", SUBMITTED = "SUBMITTED", ANSWERED = "ANSWERED",
+            WITHDRAWN = "WITHDRAWN";
     public static final String DEMO_CURRENT_LESSON_ID = "demo-session-current";
     public static final String DEMO_REVIEW_LESSON_ID = "demo-session-review";
     public static final String UNDERSTANDING = "UNDERSTANDING",
             SPEED = "SPEED",
             TERM = "TERM",
-            CALCULATION = "CALCULATION";
+            CALCULATION = "CALCULATION",
+            UNDERSTOOD = "UNDERSTOOD";
+    public static final List<String> REACTION_TYPES = Collections.unmodifiableList(
+            Arrays.asList(UNDERSTANDING, SPEED, TERM, CALCULATION, UNDERSTOOD));
 
     private Models() {}
 

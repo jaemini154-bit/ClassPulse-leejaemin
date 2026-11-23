@@ -196,9 +196,42 @@ public class LessonRepositoryInstrumentedTest {
         assertNull(lesson(id).currentVisitId);
         ok(cb -> repo.endLesson(id, cb));
         assertEquals(Models.ENDED, lesson(id).status);
+        assertNull(lesson(id).currentTopicId);
+        assertNull(lesson(id).currentVisitId);
+        assertNull(lesson(id).resumeTopicId);
+        assertTrue(lesson(id).topic(topicC).completed);
         String after =
                 success(cb -> repo.submitQuestion(null, id, topicA, UID, "수업 종료 후 질문도 남깁니다", cb));
         assertEquals(Models.SUBMITTED, lesson(id).question(after).status);
+    }
+
+    @Test
+    public void endingLessonCompletesTheActiveTopicAndKeepsOtherTopicsUnfinished() {
+        for (boolean revisit : new boolean[] {false, true}) {
+            String id = create();
+            join(id);
+            ok(cb -> repo.startLesson(id, cb));
+            String first = lesson(id).currentTopicId;
+            if (revisit) {
+                ok(cb -> repo.completeTopic(id, cb));
+                ok(cb -> repo.revisitTopic(id, first, cb));
+            }
+            String visitId = lesson(id).currentVisitId;
+            ok(cb -> repo.endLesson(id, cb));
+            Models.Lesson ended = lesson(id);
+            assertEquals(Models.ENDED, ended.status);
+            assertNull(ended.currentTopicId);
+            assertNull(ended.currentVisitId);
+            assertNull(ended.resumeTopicId);
+            for (Models.Topic topic : ended.topics)
+                assertEquals(topic.id.equals(first), topic.completed);
+            for (Models.Visit visit : ended.visits)
+                if (visit.id.equals(visitId)) assertTrue(visit.endedAt > 0);
+            assertTrue(ended.questionsOpen);
+            ok(cb -> repo.endLesson(id, cb));
+            assertNull(lesson(id).currentTopicId);
+            assertTrue(lesson(id).topic(first).completed);
+        }
     }
 
     @Test
@@ -206,41 +239,84 @@ public class LessonRepositoryInstrumentedTest {
         String id = create();
         join(id);
         ok(cb -> repo.startLesson(id, cb));
-        ok(cb -> repo.react(id, UID, Models.UNDERSTANDING, cb));
+        String visit = lesson(id).currentVisitId;
+        assertTrue(this.<Boolean>success(cb -> repo.toggleReaction(id, UID, visit, Models.UNDERSTANDING, cb)));
         LessonRow row = db.lessonDao().lesson(id);
         row.questionsOpen = false;
         db.lessonDao().updateLesson(row);
-        assertTrue(failure((LessonRepository.Callback<Void> cb) ->
-                repo.react(id, UID, Models.SPEED, cb)).contains("접수를 마감"));
+        assertTrue(this.<Boolean>failure(cb ->
+                repo.toggleReaction(id, UID, visit, Models.UNDERSTANDING, cb)).contains("접수를 마감"));
         assertEquals(1, lesson(id).reactions.size());
         row.questionsOpen = true;
         db.lessonDao().updateLesson(row);
-        ok(cb -> repo.react(id, UID, Models.SPEED, cb));
-        assertEquals(2, lesson(id).reactions.size());
+        assertFalse(this.<Boolean>success(cb -> repo.toggleReaction(id, UID, visit, Models.UNDERSTANDING, cb)));
+        assertEquals(0, lesson(id).reactions.size());
         while (lesson(id).currentVisitId != null) ok(cb -> repo.completeTopic(id, cb));
-        failure((LessonRepository.Callback<Void> cb) -> repo.react(id, UID, Models.TERM, cb));
-        assertEquals(2, lesson(id).reactions.size());
+        this.<Boolean>failure(cb -> repo.toggleReaction(id, UID, visit, Models.TERM, cb));
+        assertEquals(0, lesson(id).reactions.size());
     }
 
     @Test
-    public void reactionIsIdempotentPerVisitAndRequiresMembership() {
+    public void reactionTogglesOnlyForTheCurrentVisitAndRequiresMembership() {
         String id = create();
         ok(cb -> repo.startLesson(id, cb));
-        failure((LessonRepository.Callback<Void> cb) ->
-                repo.react(id, UID, Models.UNDERSTANDING, cb));
+        String visit = lesson(id).currentVisitId;
+        this.<Boolean>failure(cb -> repo.toggleReaction(id, UID, visit, Models.UNDERSTANDING, cb));
         join(id);
-        ok(cb -> repo.react(id, UID, Models.UNDERSTANDING, cb));
-        ok(cb -> repo.react(id, UID, Models.UNDERSTANDING, cb));
-        ok(cb -> repo.react(id, UID, Models.SPEED, cb));
+        assertTrue(this.<Boolean>success(cb -> repo.toggleReaction(id, UID, visit, Models.UNDERSTANDING, cb)));
+        assertFalse(this.<Boolean>success(cb -> repo.toggleReaction(id, UID, visit, Models.UNDERSTANDING, cb)));
+        assertTrue(this.<Boolean>success(cb -> repo.toggleReaction(id, UID, visit, Models.UNDERSTANDING, cb)));
+        assertTrue(this.<Boolean>success(cb -> repo.toggleReaction(id, UID, visit, Models.SPEED, cb)));
         assertEquals(2, lesson(id).reactions.size());
         String a = lesson(id).currentTopicId;
         ok(cb -> repo.completeTopic(id, cb));
         ok(cb -> repo.revisitTopic(id, a, cb));
-        ok(cb -> repo.react(id, UID, Models.UNDERSTANDING, cb));
-        assertEquals(3, lesson(id).reactions.size());
+        this.<Boolean>failure(cb -> repo.toggleReaction(id, UID, visit, Models.UNDERSTANDING, cb));
+        String revisit = lesson(id).currentVisitId;
+        assertTrue(this.<Boolean>success(cb -> repo.toggleReaction(id, UID, revisit, Models.UNDERSTANDING, cb)));
+        assertFalse(this.<Boolean>success(cb -> repo.toggleReaction(id, UID, revisit, Models.UNDERSTANDING, cb)));
+        assertEquals(2, lesson(id).reactions.size());
         ok(cb -> repo.endLesson(id, cb));
-        failure((LessonRepository.Callback<Void> cb) -> repo.react(id, UID, Models.TERM, cb));
-        assertEquals(3, lesson(id).reactions.size());
+        this.<Boolean>failure(cb -> repo.toggleReaction(id, UID, revisit, Models.SPEED, cb));
+        assertEquals(2, lesson(id).reactions.size());
+    }
+
+    @Test
+    public void localDraftsRequireTextAndCanBeDeletedWithoutRemovingSubmittedQuestions() {
+        String sid = create();
+        join(sid);
+        String topic = lesson(sid).topics.get(0).id;
+        String draftId = java.util.UUID.randomUUID().toString();
+        this.<String>failure(cb -> repo.saveDraft(draftId, sid, topic, UID, "  \t ", cb));
+        assertNull(db.lessonDao().question(draftId));
+        assertEquals(draftId, this.<String>success(cb -> repo.saveDraft(draftId, sid, topic, UID, "저장할 초안", cb)));
+        this.<String>failure(cb -> repo.saveDraft(draftId, sid, topic, UID, "  ", cb));
+        assertEquals("저장할 초안", lesson(sid).question(draftId).text);
+        ok(cb -> repo.deleteQuestionDraft(sid, draftId, UID, cb));
+        assertNull(lesson(sid).question(draftId));
+        this.<String>failure(cb -> repo.saveDraft(draftId, sid, topic, UID, "늦은 자동 저장", cb));
+        String submitted = success(cb -> repo.submitQuestion(null, sid, topic, UID, "제출한 질문", cb));
+        this.<Void>failure(cb -> repo.deleteQuestionDraft(sid, submitted, UID, cb));
+        assertEquals(Models.SUBMITTED, lesson(sid).question(submitted).status);
+    }
+
+    @Test
+    public void onlyUnansweredSubmittedQuestionsCanBeWithdrawnFromTheLocalLesson() {
+        String sid = create();
+        join(sid);
+        String topic = lesson(sid).topics.get(0).id;
+        String question = success(cb -> repo.submitQuestion(null, sid, topic, UID, "취소할 질문", cb));
+        ok(cb -> repo.withdrawQuestion(sid, question, UID, cb));
+        ok(cb -> repo.withdrawQuestion(sid, question, UID, cb));
+        assertNull(lesson(sid).question(question));
+        assertTrue(this.<String>failure(cb ->
+                repo.submitQuestion(question, sid, topic, UID, "취소할 질문", cb)).contains("취소"));
+        this.<Void>failure(cb -> repo.saveAnswer(question, "늦은 답변", true, cb));
+
+        String answered = success(cb -> repo.submitQuestion(null, sid, topic, UID, "남길 질문", cb));
+        ok(cb -> repo.saveAnswer(answered, "공개 답변", true, cb));
+        this.<Void>failure(cb -> repo.withdrawQuestion(sid, answered, UID, cb));
+        assertEquals(Models.ANSWERED, lesson(sid).question(answered).status);
     }
 
     @Test

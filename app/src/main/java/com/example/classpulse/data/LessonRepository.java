@@ -50,8 +50,6 @@ public final class LessonRepository {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final LiveData<List<Models.Lesson>> lessons;
     private final MutableLiveData<String> initializationError = new MutableLiveData<>();
-    private static final List<String> REACTION_TYPES =
-            Arrays.asList(Models.UNDERSTANDING, Models.SPEED, Models.TERM, Models.CALCULATION);
 
     public static LessonRepository get(Context context) {
         if (instance == null)
@@ -477,7 +475,13 @@ public final class LessonRepository {
                     LessonRow l = requireLesson(sessionId);
                     if (Models.ENDED.equals(l.status)) return null;
                     requireLive(l);
+                    if (l.currentVisitId != null) {
+                        TopicRow current = requireTopic(l.id, l.currentTopicId);
+                        current.completed = true;
+                        dao.updateTopic(current);
+                    }
                     closeVisit(l);
+                    l.currentTopicId = null;
                     l.resumeTopicId = null;
                     l.status = Models.ENDED;
                     dao.updateLesson(l);
@@ -522,7 +526,7 @@ public final class LessonRepository {
                     if (submit && !l.questionsOpen)
                         throw new IllegalStateException("이 수업의 질문 접수가 마감됐어요.");
                     String value = clean(text);
-                    if (submit && value.isEmpty())
+                    if (value.isEmpty())
                         throw new IllegalArgumentException("질문 내용을 입력해 주세요.");
                     if (value.length() > 1000)
                         throw new IllegalArgumentException("질문은 1,000자까지 입력할 수 있어요.");
@@ -533,6 +537,8 @@ public final class LessonRepository {
                     if (q != null) {
                         if (!q.studentId.equals(uid) || !q.sessionId.equals(l.id))
                             throw new IllegalStateException("이 질문을 수정할 수 없어요.");
+                        if (Models.WITHDRAWN.equals(q.status))
+                            throw new IllegalStateException("이미 제출을 취소한 질문이에요. 새 질문을 작성해 주세요.");
                         if (!Models.DRAFT.equals(q.status)) {
                             if (q.topicId.equals(topicId) && q.text.equals(value) && submit)
                                 return q.id;
@@ -559,6 +565,40 @@ public final class LessonRepository {
                 cb);
     }
 
+    public void deleteQuestionDraft(String sessionId, String questionId, String uid, Callback<Void> cb) {
+        execute(() -> {
+            requireMember(sessionId, uid);
+            QuestionRow question = dao.question(questionId);
+            if (question == null || !sessionId.equals(question.sessionId) || !uid.equals(question.studentId))
+                throw new IllegalStateException("내가 작성 중인 초안만 삭제할 수 있어요.");
+            if (Models.WITHDRAWN.equals(question.status)) return null;
+            if (!Models.DRAFT.equals(question.status))
+                throw new IllegalStateException("이미 제출한 질문이에요.");
+            question.status = Models.WITHDRAWN;
+            question.text = "";
+            question.updatedAt = System.currentTimeMillis();
+            dao.saveQuestion(question);
+            return null;
+        }, cb);
+    }
+
+    public void withdrawQuestion(String sessionId, String questionId, String uid, Callback<Void> cb) {
+        execute(() -> {
+            requireMember(sessionId, uid);
+            QuestionRow question = dao.question(questionId);
+            if (question == null || !sessionId.equals(question.sessionId) || !uid.equals(question.studentId))
+                throw new IllegalStateException("내가 제출한 질문만 취소할 수 있어요.");
+            if (Models.WITHDRAWN.equals(question.status)) return null;
+            if (!Models.SUBMITTED.equals(question.status) || question.published || question.answerVersion != 0)
+                throw new IllegalStateException("답변을 기다리는 제출 질문만 취소할 수 있어요.");
+            question.status = Models.WITHDRAWN;
+            question.text = "";
+            question.updatedAt = System.currentTimeMillis();
+            dao.saveQuestion(question);
+            return null;
+        }, cb);
+    }
+
     public void saveMark(
             String sessionId, String topicId, String uid, String keyword, Callback<String> cb) {
         execute(
@@ -582,7 +622,8 @@ public final class LessonRepository {
                 cb);
     }
 
-    public void react(String sessionId, String uid, String type, Callback<Void> cb) {
+    public void toggleReaction(String sessionId, String uid, String visitId, String type,
+                               Callback<Boolean> cb) {
         execute(
                 () -> {
                     LessonRow l = requireLesson(sessionId);
@@ -592,10 +633,14 @@ public final class LessonRepository {
                         throw new IllegalStateException("교수님이 질문·반응 접수를 마감했어요.");
                     if (l.currentVisitId == null)
                         throw new IllegalStateException("지금 진행 중인 대주제가 없어요.");
-                    if (!REACTION_TYPES.contains(type))
+                    if (!l.currentVisitId.equals(visitId))
+                        throw new IllegalStateException("진도가 바뀌었어요. 현재 주제를 다시 확인해 주세요.");
+                    if (!Models.REACTION_TYPES.contains(type))
                         throw new IllegalArgumentException("반응 유형을 다시 선택해 주세요.");
+                    String reactionId = stableId(uid, visitId, type);
+                    if (dao.deleteReaction(reactionId) != 0) return false;
                     ReactionRow r = new ReactionRow();
-                    r.id = stableId(uid, l.currentVisitId, type);
+                    r.id = reactionId;
                     r.sessionId = l.id;
                     r.topicId = l.currentTopicId;
                     r.visitId = l.currentVisitId;
@@ -603,7 +648,7 @@ public final class LessonRepository {
                     r.type = type;
                     r.createdAt = System.currentTimeMillis();
                     dao.insertReaction(r);
-                    return null;
+                    return true;
                 },
                 cb);
     }
@@ -612,7 +657,7 @@ public final class LessonRepository {
         execute(
                 () -> {
                     QuestionRow q = dao.question(questionId);
-                    if (q == null || Models.DRAFT.equals(q.status))
+                    if (q == null || !(Models.SUBMITTED.equals(q.status) || Models.ANSWERED.equals(q.status)))
                         throw new IllegalStateException("접수된 질문을 선택해 주세요.");
                     String value = clean(answer);
                     if (publish && value.isEmpty())
@@ -961,6 +1006,7 @@ public final class LessonRepository {
                 l.members.add(x);
             }
             for (QuestionRow r : g.questions) {
+                if (Models.WITHDRAWN.equals(r.status) || Models.DRAFT.equals(r.status) && r.text.trim().isEmpty()) continue;
                 Models.Question x = new Models.Question();
                 x.id = r.id;
                 x.sessionId = r.sessionId;

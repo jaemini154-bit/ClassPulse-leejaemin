@@ -5,7 +5,7 @@ const {
     Timestamp,
     FieldValue
 } = require("firebase-admin/firestore");
-const TYPES = ["UNDERSTANDING", "SPEED", "TERM", "CALCULATION"];
+const TYPES = ["UNDERSTANDING", "SPEED", "TERM", "CALCULATION", "UNDERSTOOD"];
 class DomainError extends Error {
     constructor(reason, message, code = "failed-precondition") {
         super(message);
@@ -542,7 +542,11 @@ function createService(db, {
                 if (!next) progress.currentTopicId = target;
             }
             if (action === "END") {
+                if (progress.currentVisitId && progress.currentTopicId
+                        && !progress.completedTopicIds.includes(progress.currentTopicId))
+                    progress.completedTopicIds.push(progress.currentTopicId);
                 status = "ENDED";
+                progress.currentTopicId = null;
                 progress.resumeTopicId = null;
             }
             if (oldVisit?.exists) tx.set(oldVisit.ref, bump(oldVisit.data(), now, {
@@ -617,7 +621,7 @@ function createService(db, {
     async function savePersonal(uid, p, kind) {
         const key = id(p.id),
             topicId = id(p.topicId),
-            value = text(p.text || "", kind === "marks" ? 200 : 1000, false);
+            value = text(p.text || "", kind === "marks" ? 200 : 1000, kind === "questionDrafts");
         return command(uid, kind === "marks" ? "saveMark" : "savePersonalDraft", p, async (tx, now) => {
             const {
                 ref,
@@ -654,9 +658,15 @@ function createService(db, {
                 snap = await tx.get(target),
                 old = snap.data();
             if (!old) fail("NOT_FOUND", "기록을 찾지 못했어요.", "not-found");
+            if (p.kind === "questionDrafts" && old.submittedQuestionId) {
+                fail("DRAFT_CLOSED", "이미 제출한 질문이에요. 질문 상세에서 제출 상태를 확인해 주세요.");
+            }
+            if (old.deletedAt) return { id: p.id, kind: p.kind, document: old };
             if (old.revision !== integer(p.baseRevision)) fail("VERSION_CONFLICT", "다른 기기에서 기록이 바뀌었어요.");
             const v = bump(old, now, {
-                deletedAt: now
+                deletedAt: now,
+                lastOperationId: p.operationId,
+                ...(p.kind === "questionDrafts" ? { text: "" } : {})
             });
             tx.set(target, v);
             return {
@@ -681,6 +691,7 @@ function createService(db, {
                 existing = await tx.get(qref);
             if (existing.exists) {
                 const q = existing.data();
+                if (q.authorUid === uid && q.deletedAt) fail("QUESTION_WITHDRAWN", "이미 제출을 취소한 질문이에요. 새 질문을 작성해 주세요.");
                 if (q.authorUid !== uid || q.text !== value || q.topicId !== topicId) fail("QUESTION_LOCKED", "접수된 질문의 내용과 주제는 바꿀 수 없어요.");
                 return {
                     id: qid,
@@ -735,83 +746,114 @@ function createService(db, {
             };
         });
     }
-    async function submitReaction(uid, p) {
-        const visitId = id(p.visitId),
-            topicId = id(p.topicId);
-        if (!TYPES.includes(p.type)) fail("INVALID_REACTION", "반응 종류를 확인해 주세요.", "invalid-argument");
-        return command(uid, "submitReaction", p, async (tx, now) => {
-            const {
-                ref,
-                s,
-                owner
-            } = await access(tx, p.sessionId, uid);
-            if (owner) fail("STUDENT_REQUIRED", "학생 참여 계정으로 반응해 주세요.", "permission-denied");
-            const reactionId = hash([p.sessionId, uid, visitId, p.type]),
-                eventRef = ref.collection("reactionEvents").doc(reactionId),
-                event = await tx.get(eventRef);
-            if (event.exists) return {
-                reactionId,
-                receipt: {
-                    id: reactionId,
-                    topicId,
-                    visitId,
-                    type: p.type,
-                    createdAt: event.data().createdAt,
-                    revision: 1
-                }
-            };
-            if (s.status !== "LIVE" || s.progress.currentVisitId !== visitId || s.progress.currentTopicId !== topicId) fail("STALE_VISIT", "진도가 바뀌어 지난 구간의 반응은 접수하지 않았어요.");
-            if (s.questionsOpen === false) fail("REACTIONS_CLOSED", "교수님이 질문·반응 접수를 마감했어요.");
-            const scopes = ["summary", `topic_${topicId}`, `visit_${visitId}`];
-            const reads = [];
-            for (const scope of scopes) {
-                const a = ref.collection("analytics").doc(scope),
-                    presence = ref.collection("reactionPresence").doc(hash([scope, uid]));
-                reads.push({
-                    a,
-                    presence
-                });
+    async function withdrawQuestion(uid, p) {
+        const qid = id(p.id);
+        return command(uid, "withdrawQuestion", p, async (tx, now) => {
+            const { ref } = await access(tx, p.sessionId, uid);
+            const questionRef = ref.collection("questions").doc(qid);
+            const question = (await tx.get(questionRef)).data();
+            if (!question) fail("NOT_FOUND", "접수된 질문을 찾지 못했어요.", "not-found");
+            if (question.authorUid !== uid) {
+                fail("QUESTION_AUTHOR_REQUIRED", "내가 제출한 질문만 취소할 수 있어요.", "permission-denied");
             }
-            const snaps = await tx.getAll(...reads.map(x => x.presence));
-            tx.create(eventRef, fresh(now, {
-                uid,
-                sessionId: p.sessionId,
-                topicId,
-                visitId,
-                type: p.type
-            }));
-            const receipt = fresh(now, {
-                topicId,
-                visitId,
-                type: p.type
-            });
-            tx.set(personal(uid, p.sessionId, "reactionReceipts", reactionId), receipt);
-            reads.forEach((item, i) => {
-                const prior = snaps[i].data(),
-                    types = prior?.types || [];
-                tx.update(item.a, {
-                    reactionEventCount: FieldValue.increment(1),
-                    uniqueReactingStudents: FieldValue.increment(prior ? 0 : 1),
-                    [`eventCountsByType.${p.type}`]: FieldValue.increment(1),
-                    [`uniqueStudentsByType.${p.type}`]: FieldValue.increment(types.includes(p.type) ? 0 : 1),
+            if (question.deletedAt) return { id: qid, question: { ...question, id: qid } };
+            if (question.status !== "SUBMITTED" || question.answerVersion !== 0) {
+                fail("QUESTION_ANSWERED", "답변이 공개된 질문은 제출을 취소할 수 없어요.");
+            }
+            const stats = await statsForQuestions(tx, ref, question.topicId, now, -1, -1);
+            const withdrawn = bump(question, now, { status: "WITHDRAWN", text: "", deletedAt: now });
+            // Keep a revisioned cancellation for other devices, outside the paginated list.
+            delete withdrawn.submittedAt;
+            tx.set(questionRef, withdrawn);
+            for (const item of stats) tx.update(item.ref, item.value);
+            return { id: qid, question: { ...withdrawn, id: qid } };
+        });
+    }
+    function submitReaction(uid, p) {
+        return updateReaction(uid, p, "submitReaction", true, null);
+    }
+    function setReaction(uid, p) {
+        if (typeof p.selected !== "boolean") {
+            fail("INVALID_REACTION", "반응 선택 상태를 확인해 주세요.", "invalid-argument");
+        }
+        return updateReaction(uid, p, "setReaction", p.selected, integer(p.baseRevision));
+    }
+    async function updateReaction(uid, p, kind, selected, baseRevision) {
+        const visitId = id(p.visitId), topicId = id(p.topicId);
+        if (!TYPES.includes(p.type)) fail("INVALID_REACTION", "반응 종류를 확인해 주세요.", "invalid-argument");
+        return command(uid, kind, p, async (tx, now) => {
+            const { ref, s, owner } = await access(tx, p.sessionId, uid);
+            if (owner) fail("STUDENT_REQUIRED", "학생 참여 계정으로 반응해 주세요.", "permission-denied");
+            const reactionId = hash([p.sessionId, uid, visitId, p.type]);
+            const eventRef = ref.collection("reactionEvents").doc(reactionId);
+            const event = (await tx.get(eventRef)).data();
+            const wasSelected = !!event && !event.deletedAt;
+            if (event && event.topicId !== topicId) {
+                fail("STALE_VISIT", "진도가 바뀌었어요. 현재 주제를 다시 확인해 주세요.");
+            }
+            if (wasSelected === selected) {
+                // Repeating an already-applied selection is harmless, including on older clients.
+                return event ? { reactionId, receipt: reactionReceipt(reactionId, event) } : { reactionId };
+            }
+            if (s.status !== "LIVE" || s.progress.currentVisitId !== visitId || s.progress.currentTopicId !== topicId) {
+                fail("STALE_VISIT", "진도가 바뀌어 지난 구간의 반응은 변경하지 않았어요.");
+            }
+            if (s.questionsOpen === false) fail("REACTIONS_CLOSED", "교수님이 질문·반응 접수를 마감했어요.");
+            if (baseRevision !== null && (event?.revision || 0) !== baseRevision) {
+                fail("REACTION_CHANGED", "다른 기기에서 반응이 바뀌었어요. 현재 선택을 다시 확인해 주세요.");
+            }
+            const scopes = [
+                { id: "summary", matches: () => true },
+                { id: `topic_${topicId}`, matches: value => value.topicId === topicId },
+                { id: `visit_${visitId}`, matches: value => value.visitId === visitId }
+            ];
+            const presence = scopes.map(scope => ref.collection("reactionPresence").doc(hash([scope.id, uid])));
+            const previous = await tx.getAll(...presence);
+            // Old presence documents only record which types appeared. Recover counts from
+            // this student's events once so canceling in a revisit preserves earlier reactions.
+            const needsCounts = previous.some(snap => snap.exists && !snap.data().countsByType);
+            const history = needsCounts
+                ? (await tx.get(ref.collection("reactionEvents").where("uid", "==", uid))).docs.map(doc => doc.data())
+                    .filter(value => !value.deletedAt)
+                : [];
+            const delta = selected ? 1 : -1;
+            scopes.forEach((scope, i) => {
+                const prior = previous[i].data();
+                const countsByType = { ...prior?.countsByType };
+                if (prior && !prior.countsByType) {
+                    for (const value of history.filter(scope.matches)) {
+                        countsByType[value.type] = (countsByType[value.type] || 0) + 1;
+                    }
+                }
+                const previousCount = countsByType[p.type] || 0;
+                const hadAny = Object.keys(countsByType).length > 0;
+                const nextCount = previousCount + delta;
+                if (nextCount === 0) delete countsByType[p.type];
+                else countsByType[p.type] = nextCount;
+                const types = Object.keys(countsByType);
+                tx.update(ref.collection("analytics").doc(scope.id), {
+                    reactionEventCount: FieldValue.increment(delta),
+                    uniqueReactingStudents: FieldValue.increment(Number(types.length > 0) - Number(hadAny)),
+                    [`eventCountsByType.${p.type}`]: FieldValue.increment(delta),
+                    [`uniqueStudentsByType.${p.type}`]: FieldValue.increment(Number(nextCount > 0) - Number(previousCount > 0)),
                     revision: FieldValue.increment(1),
                     updatedAt: now
                 });
-                tx.set(item.presence, prior ? bump(prior, now, {
-                    types: [...new Set([...types, p.type])]
-                }) : fresh(now, {
-                    uid,
-                    types: [p.type]
-                }));
+                const values = { uid, types, countsByType };
+                tx.set(presence[i], prior ? bump(prior, now, values) : fresh(now, values));
             });
-            return {
-                reactionId,
-                receipt: {
-                    id: reactionId,
-                    ...receipt
-                }
-            };
+            const next = event ? bump(event, now, { deletedAt: selected ? null : now }) : fresh(now, {
+                uid, sessionId: p.sessionId, topicId, visitId, type: p.type
+            });
+            tx.set(eventRef, next);
+            const receipt = reactionReceipt(reactionId, next);
+            tx.set(personal(uid, p.sessionId, "reactionReceipts", reactionId), receipt);
+            return { reactionId, receipt };
         });
+    }
+    function reactionReceipt(reactionId, event) {
+        const { schemaVersion, topicId, visitId, type, createdAt, updatedAt, revision, deletedAt } = event;
+        return { id: reactionId, schemaVersion, topicId, visitId, type, createdAt, updatedAt, revision, deletedAt };
     }
     async function answer(uid, p, publish) {
         const qid = id(p.id),
@@ -885,7 +927,9 @@ function createService(db, {
         saveMark: (u, p) => savePersonal(u, p, "marks"),
         deletePersonalItem: deletePersonal,
         submitQuestion,
+        withdrawQuestion,
         submitReaction,
+        setReaction,
         saveAnswerDraft: (u, p) => answer(u, p, false),
         publishAnswer: (u, p) => answer(u, p, true)
     };

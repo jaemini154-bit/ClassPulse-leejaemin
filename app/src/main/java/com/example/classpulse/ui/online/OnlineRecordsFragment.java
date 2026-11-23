@@ -3,6 +3,7 @@ package com.example.classpulse.ui.online;
 import android.os.Bundle;
 import androidx.annotation.NonNull;
 import com.example.classpulse.online.*;
+import com.example.classpulse.ui.Ui;
 import com.example.classpulse.ui.ScreenContext;
 import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 import org.json.JSONObject;
@@ -81,16 +82,9 @@ public final class OnlineRecordsFragment extends OnlineFragment {
             if (kind("OWN_REACTION").isEmpty()) ui.note(shell.content, "아직 남긴 반응이 없어요.");
             for (OnlineDatabase.Document d : kind("OWN_REACTION")) {
                 JSONObject r = OnlineJson.object(d.json);
-                String type = r.optString("type");
-                String label =
-                        "UNDERSTANDING".equals(type)
-                                ? "이해가 안 돼요"
-                                : "SPEED".equals(type)
-                                        ? "너무 빨라요"
-                                        : "TERM".equals(type) ? "용어가 어려워요" : "계산을 놓쳤어요";
                 ui.card(
                         shell.content,
-                        label,
+                        Ui.reactionLabel(r.optString("type")),
                         topicTitle(r.optString("topicId")),
                         "내 반응",
                         () -> open("online_session", screen.forLesson(screen.lessonId)));
@@ -112,18 +106,9 @@ public final class OnlineRecordsFragment extends OnlineFragment {
                 ui.heading(shell.content, "작성 중인 질문과 개인 표시", null);
                 int count = 0;
                 for (OnlineDatabase.Draft d : drafts) {
-                    if ("QUESTION_DRAFT".equals(d.kind)
-                            && (!d.closed || "QUEUED".equals(d.state))) {
+                    if (visibleQuestionDraft(d)) {
                         count++;
-                        ui.card(
-                                shell.content,
-                                d.text.isEmpty() ? "작성 중인 질문" : d.text,
-                                topicTitle(d.topicId),
-                                d.closed ? "전송 대기" : d.dirty ? "이 기기에 저장됨" : "개인 초안",
-                                () ->
-                                        open(
-                                                "online_question_edit",
-                                                screen.withQuestion(d.id).withTopic(d.topicId)));
+                        questionDraftCard(d, d.closed ? "전송 대기" : d.dirty ? "이 기기에 저장됨" : "개인 초안");
                     }
                     if ("MARK".equals(d.kind) && !"DELETED".equals(d.state)) {
                         count++;
@@ -141,6 +126,10 @@ public final class OnlineRecordsFragment extends OnlineFragment {
                                                         "질문으로 이어 쓰기",
                                                         (dialog, which) -> {
                                                             String id = OnlineJson.id();
+                                                            if (d.text.trim().isEmpty()) {
+                                                                open("online_question_edit", screen.withQuestion(id).withTopic(d.topicId));
+                                                                return;
+                                                            }
                                                             repo.saveDraft(
                                                                     screen.lessonId,
                                                                     id,

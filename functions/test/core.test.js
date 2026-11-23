@@ -15,6 +15,7 @@ const {
     deleteApp
 } = require("firebase-admin/app");
 const {
+    FieldValue,
     getFirestore
 } = require("firebase-admin/firestore");
 const {
@@ -288,6 +289,11 @@ test("progress CAS advances once; revisit preserves completion; end does not clo
     });
     assert.equal(state.session.status, "ENDED");
     assert.equal(state.session.questionsOpen, true);
+    assert.deepEqual(state.session.progress.completedTopicIds, f.topics.map(topic => topic.id));
+    assert.equal(state.session.progress.currentTopicId, null);
+    assert.equal(state.session.progress.currentVisitId, null);
+    assert.equal(state.session.progress.currentVisitStartedAt, null);
+    assert.equal(state.session.progress.resumeTopicId, null);
     await mutate(student, "submitQuestion", {
         sessionId: f.sid,
         id: op(),
@@ -301,6 +307,39 @@ test("progress CAS advances once; revisit preserves completion; end does not clo
         action: "END"
     }), "OWNER_REQUIRED");
 });
+test("ending a lesson completes only its active topic and preserves unfinished topics during a revisit", async () => {
+    for (const revisit of [false, true]) {
+        const f = await fixture();
+        await join(student, f);
+        let { session } = await start(f);
+        let version = 1;
+        if (revisit) {
+            await mutate(owner, "changeProgress", {
+                sessionId: f.sid, action: "COMPLETE_NEXT", expectedProgressVersion: version++
+            });
+            ({ session } = await mutate(owner, "changeProgress", {
+                sessionId: f.sid, action: "REVISIT", topicId: f.topics[0].id, expectedProgressVersion: version++
+            }));
+        }
+        const visitId = session.progress.currentVisitId;
+        const request = { sessionId: f.sid, action: "END", operationId: op(), expectedProgressVersion: version };
+        const ended = await invoke(owner, "changeProgress", request);
+        assert.deepEqual(await invoke(owner, "changeProgress", request), ended);
+        const state = await invoke(student, "getSessionBootstrap", { sessionId: f.sid });
+        assert.equal(state.session.status, "ENDED");
+        assert.deepEqual(state.session.progress.completedTopicIds, [f.topics[0].id]);
+        assert.equal(state.session.progress.currentTopicId, null);
+        assert.equal(state.session.progress.currentVisitId, null);
+        assert.equal(state.session.progress.currentVisitStartedAt, null);
+        assert.equal(state.session.progress.resumeTopicId, null);
+        assert.equal(state.session.questionsOpen, true);
+        assert.ok((await db.doc("sessions/" + f.sid + "/visits/" + visitId).get()).data().endedAt);
+        await expectReason(() => mutate(student, "submitReaction", {
+            sessionId: f.sid, topicId: f.topics[0].id, visitId, type: "UNDERSTOOD"
+        }), "STALE_VISIT");
+    }
+});
+
 test("subtopics are grouped in the outline and progress follows teachable topics", async () => {
     const f = { sid: op() };
     const parent = { id: op(), title: "조건부확률" };
@@ -356,6 +395,10 @@ test("subtopics are grouped in the outline and progress follows teachable topics
     ({ session } = await update("COMPLETE_NEXT", 4));
     assert.equal(session.progress.currentTopicId, standalone.id);
     ({ session } = await update("COMPLETE_NEXT", 5));
+    assert.equal(session.progress.currentVisitId, null);
+    assert.deepEqual(session.progress.completedTopicIds, [second.id, first.id, standalone.id]);
+    ({ session } = await update("END", 6));
+    assert.equal(session.progress.currentTopicId, null);
     assert.equal(session.progress.currentVisitId, null);
     assert.deepEqual(session.progress.completedTopicIds, [second.id, first.id, standalone.id]);
 });
@@ -426,6 +469,125 @@ test("reaction deduplication, distinct student counts, revisit and stale-visit r
     assert.equal(summary.uniqueReactingStudents, 1);
     assert.equal(summary.uniqueStudentsByType.UNDERSTANDING, 1);
 });
+test("canceling a reaction updates all scopes without losing other visits, types, or students", async () => {
+    const f = await fixture();
+    const inv = await invite(f);
+    await join(student, f, inv);
+    await join(other, f, inv);
+    const started = await start(f);
+    const topicId = f.topics[0].id;
+    const first = { sessionId: f.sid, topicId, visitId: started.session.progress.currentVisitId,
+        type: "TERM" };
+    await mutate(student, "submitReaction", first);
+    await mutate(owner, "changeProgress", {
+        sessionId: f.sid, expectedProgressVersion: 1, action: "COMPLETE_NEXT"
+    });
+    const revisit = await mutate(owner, "changeProgress", {
+        sessionId: f.sid, topicId, expectedProgressVersion: 2, action: "REVISIT"
+    });
+    const visitId = revisit.session.progress.currentVisitId;
+    const current = { ...first, visitId };
+    await mutate(student, "submitReaction", current);
+    await mutate(student, "submitReaction", { ...current, type: "SPEED" });
+    await mutate(other, "submitReaction", current);
+
+    const base = `sessions/${f.sid}`;
+    // Simulate presence documents written before per-type counts were stored.
+    const scopes = ["summary", `topic_${topicId}`, `visit_${visitId}`];
+    for (const scope of scopes) {
+        const ref = db.doc(`${base}/reactionPresence/${hash([scope, student])}`);
+        const { uid, types } = (await ref.get()).data();
+        await ref.set({ uid, types });
+    }
+    const cancel = { ...current, operationId: op(), selected: false, baseRevision: 1 };
+    const canceled = await invoke(student, "setReaction", cancel);
+    assert.ok(canceled.receipt.deletedAt);
+    assert.equal(canceled.receipt.revision, 2);
+    assert.deepEqual(await invoke(student, "setReaction", cancel), canceled);
+    assert.equal((await mutate(student, "setReaction", { ...current, selected: false, baseRevision: 1 }))
+        .receipt.revision, 2);
+    await expectReason(() => mutate(student, "setReaction", { ...first, selected: false, baseRevision: 1 }),
+        "STALE_VISIT");
+    const stats = async scope => (await db.doc(`${base}/analytics/${scope}`).get()).data();
+    for (const scope of scopes.slice(0, 2)) {
+        const value = await stats(scope);
+        assert.equal(value.reactionEventCount, 3);
+        assert.equal(value.uniqueReactingStudents, 2);
+        assert.equal(value.eventCountsByType.TERM, 2);
+        assert.equal(value.uniqueStudentsByType.TERM, 2);
+    }
+    let value = await stats(scopes[2]);
+    assert.equal(value.reactionEventCount, 2);
+    assert.equal(value.uniqueReactingStudents, 2);
+    assert.equal(value.uniqueStudentsByType.TERM, 1);
+
+    const receipt = (await db.doc(`users/${student}/lessonData/${f.sid}/reactionReceipts/${canceled.reactionId}`).get()).data();
+    assert.ok(receipt.deletedAt);
+    assert.equal(receipt.uid, undefined);
+    const restored = await mutate(student, "setReaction", { ...current, selected: true, baseRevision: 2 });
+    assert.equal(restored.receipt.deletedAt, null);
+    assert.equal(restored.receipt.revision, 3);
+    await expectReason(() => mutate(student, "setReaction", { ...current, selected: false, baseRevision: 1 }),
+        "REACTION_CHANGED");
+    await invoke(student, "setReaction", cancel); // Late replay cannot cancel the new selection.
+    assert.equal((await stats("summary")).reactionEventCount, 4);
+
+    const closed = await mutate(owner, "setQuestionsOpen", { sessionId: f.sid,
+        baseRevision: revisit.session.revision, open: false });
+    await expectReason(() => mutate(student, "setReaction", { ...current, selected: false, baseRevision: 3 }),
+        "REACTIONS_CLOSED");
+    await mutate(owner, "setQuestionsOpen", { sessionId: f.sid, baseRevision: closed.session.revision, open: true });
+    await mutate(student, "setReaction", { ...current, selected: false, baseRevision: 3 });
+    await mutate(student, "setReaction", { ...current, type: "SPEED", selected: false, baseRevision: 1 });
+    value = await stats(scopes[2]);
+    assert.equal(value.reactionEventCount, 1);
+    assert.equal(value.uniqueReactingStudents, 1);
+    assert.equal(value.uniqueStudentsByType.SPEED, 0);
+    assert.equal((await stats("summary")).uniqueReactingStudents, 2);
+});
+
+test("understood is counted and canceled independently on existing class analytics", async () => {
+    const f = await fixture();
+    await join(student, f);
+    const started = await start(f);
+    const topicId = f.topics[0].id;
+    const visitId = started.session.progress.currentVisitId;
+    const payload = { sessionId: f.sid, topicId, visitId };
+    await mutate(student, "submitReaction", { ...payload, type: "UNDERSTANDING" });
+    const stats = ["summary", "topic_" + topicId, "visit_" + visitId]
+        .map(scope => db.doc("sessions/" + f.sid + "/analytics/" + scope));
+    for (const ref of stats)
+        await ref.update({
+            "eventCountsByType.UNDERSTOOD": FieldValue.delete(),
+            "uniqueStudentsByType.UNDERSTOOD": FieldValue.delete()
+        });
+
+    const reaction = { ...payload, type: "UNDERSTOOD" };
+    const submitted = await mutate(student, "setReaction", { ...reaction, selected: true, baseRevision: 0 });
+    assert.equal(submitted.receipt.type, "UNDERSTOOD");
+    for (const ref of stats) {
+        const value = (await ref.get()).data();
+        assert.equal(value.reactionEventCount, 2);
+        assert.equal(value.uniqueReactingStudents, 1);
+        assert.equal(value.eventCountsByType.UNDERSTANDING, 1);
+        assert.equal(value.eventCountsByType.UNDERSTOOD, 1);
+        assert.equal(value.uniqueStudentsByType.UNDERSTOOD, 1);
+    }
+
+    const canceled = await mutate(student, "setReaction", {
+        ...reaction, selected: false, baseRevision: submitted.receipt.revision
+    });
+    assert.ok(canceled.receipt.deletedAt);
+    for (const ref of stats) {
+        const value = (await ref.get()).data();
+        assert.equal(value.reactionEventCount, 1);
+        assert.equal(value.uniqueReactingStudents, 1);
+        assert.equal(value.eventCountsByType.UNDERSTANDING, 1);
+        assert.equal(value.eventCountsByType.UNDERSTOOD, 0);
+        assert.equal(value.uniqueStudentsByType.UNDERSTOOD, 0);
+    }
+});
+
 test("closing question intake also rejects delayed reactions; reopening accepts both without duplicate counts", async () => {
     const f = await fixture();
     await join(student, f);
@@ -468,6 +630,73 @@ test("closing question intake also rejects delayed reactions; reopening accepts 
         sessionId: f.sid, id: draftId, topicId: f.topics[0].id, text: "마감 중에도 남기는 초안", baseRevision: 1
     });
     assert.equal((await db.doc(`sessions/${f.sid}/analytics/summary`).get()).data().reactionEventCount, 2);
+});
+
+test("only the author can withdraw an unanswered question and the cancellation is counted once", async () => {
+    const f = await fixture();
+    const inv = await invite(f);
+    await join(student, f, inv);
+    await join(other, f, inv);
+    const topicId = f.topics[0].id;
+    const payload = { sessionId: f.sid, topicId, id: op(), text: "취소할 질문", baseRevision: 0 };
+    const submitted = { ...payload, operationId: op() };
+    await invoke(student, "submitQuestion", submitted);
+    await mutate(other, "submitQuestion", { ...payload, id: op(), text: "다른 학생의 질문" });
+    const request = { sessionId: f.sid, id: payload.id, operationId: op() };
+    for (const uid of [owner, other]) {
+        await expectReason(() => invoke(uid, "withdrawQuestion", request), "QUESTION_AUTHOR_REQUIRED");
+    }
+    const session = await invoke(owner, "getSessionBootstrap", { sessionId: f.sid });
+    await mutate(owner, "setQuestionsOpen", { sessionId: f.sid, baseRevision: session.session.revision, open: false });
+    const withdrawn = await invoke(student, "withdrawQuestion", request);
+    assert.equal(withdrawn.question.status, "WITHDRAWN");
+    assert.ok(withdrawn.question.deletedAt);
+    assert.equal(withdrawn.question.revision, 2);
+    assert.equal(withdrawn.question.text, "");
+    assert.deepEqual(await invoke(student, "withdrawQuestion", request), withdrawn);
+    assert.deepEqual(await invoke(student, "withdrawQuestion", { ...request, operationId: op() }), withdrawn);
+    await invoke(student, "submitQuestion", submitted); // Retry a previously acknowledged request.
+    await expectReason(() => mutate(student, "submitQuestion", payload), "QUESTION_WITHDRAWN");
+    await expectReason(() => mutate(owner, "publishAnswer", {
+        sessionId: f.sid, id: payload.id, text: "늦은 답변", baseRevision: 0, baseAnswerVersion: 0
+    }), "NOT_FOUND");
+    for (const key of ["summary", `topic_${topicId}`]) {
+        const stats = (await db.doc(`sessions/${f.sid}/analytics/${key}`).get()).data();
+        assert.equal(stats.submittedQuestionCount, 1);
+        assert.equal(stats.unansweredQuestionCount, 1);
+    }
+    const teacherQuestions = collection(env.authenticatedContext(owner).firestore(), "sessions", f.sid, "questions");
+    assert.equal((await getDocs(query(teacherQuestions, orderBy("submittedAt", "desc")))).size, 1);
+    const studentQuestions = collection(env.authenticatedContext(student).firestore(), "sessions", f.sid, "questions");
+    assert.equal((await assertSucceeds(getDocs(query(studentQuestions,
+        where("authorUid", "==", student), where("status", "==", "WITHDRAWN"))))).size, 1);
+    await assertFails(getDocs(query(studentQuestions, where("status", "==", "WITHDRAWN"))));
+});
+
+test("publishing an answer and withdrawing a submission cannot both win", async () => {
+    const f = await fixture();
+    await join(student, f);
+    const payload = { sessionId: f.sid, id: op(), topicId: f.topics[0].id, text: "답변 공개 확인", baseRevision: 0 };
+    const answer = { sessionId: f.sid, id: payload.id, text: "답변", baseRevision: 0, baseAnswerVersion: 0 };
+    const request = { sessionId: f.sid, id: payload.id };
+    await mutate(student, "submitQuestion", payload);
+    const [publish, withdraw] = await Promise.allSettled([
+        mutate(owner, "publishAnswer", answer), mutate(student, "withdrawQuestion", request)
+    ]);
+    assert.notEqual(publish.status, withdraw.status);
+    const counted = (await db.doc(`sessions/${f.sid}/analytics/summary`).get()).data();
+    assert.equal(counted.unansweredQuestionCount, 0);
+    if (publish.status === "fulfilled") {
+        assert.equal(withdraw.reason.reason, "QUESTION_ANSWERED");
+        assert.equal(counted.submittedQuestionCount, 1);
+    } else {
+        assert.equal(publish.reason.reason, "NOT_FOUND");
+        assert.equal(counted.submittedQuestionCount, 0);
+    }
+    const alreadyAnswered = op();
+    await mutate(student, "submitQuestion", { ...payload, id: alreadyAnswered });
+    await mutate(owner, "publishAnswer", { ...answer, id: alreadyAnswered });
+    await expectReason(() => mutate(student, "withdrawQuestion", { ...request, id: alreadyAnswered }), "QUESTION_ANSWERED");
 });
 
 test("personal drafts stay private; submissions pin topic and reject edits; publish has no author fields", async () => {
@@ -531,6 +760,30 @@ test("personal drafts stay private; submissions pin topic and reject edits; publ
     });
     assert.equal((await db.doc(`sessions/${f.sid}/analytics/summary`).get()).data().unansweredQuestionCount, 0);
 });
+test("blank question drafts are rejected and deletion is limited to private unsubmitted drafts", async () => {
+    const f = await fixture();
+    await join(student, f);
+    const topicId = f.topics[0].id;
+    const payload = { sessionId: f.sid, topicId, id: op(), text: " \n \t ", baseRevision: 0 };
+    const draft = db.doc(`users/${student}/lessonData/${f.sid}/questionDrafts/${payload.id}`);
+    await expectReason(() => mutate(student, "savePersonalDraft", payload), "INVALID_TEXT");
+    assert.equal((await draft.get()).exists, false);
+    await mutate(student, "saveMark", { ...payload, id: op() });
+    await mutate(student, "savePersonalDraft", { ...payload, text: "이어 쓸 원고" });
+    await expectReason(() => mutate(student, "savePersonalDraft", { ...payload, baseRevision: 1 }), "INVALID_TEXT");
+    assert.equal((await draft.get()).data().text, "이어 쓸 원고");
+    const remove = { sessionId: f.sid, id: payload.id, kind: "questionDrafts", baseRevision: 1 };
+    await expectReason(() => mutate(other, "deletePersonalItem", remove), "NOT_FOUND");
+    const deleted = await mutate(student, "deletePersonalItem", remove);
+    assert.ok(deleted.document.deletedAt);
+    assert.equal(deleted.document.text, "");
+    assert.equal((await mutate(student, "deletePersonalItem", remove)).document.revision, 2);
+    await expectReason(() => mutate(student, "savePersonalDraft", { ...payload, text: "되돌리지 않음", baseRevision: 2 }), "DRAFT_CLOSED");
+    const submitted = { ...payload, id: op(), text: "이미 제출한 질문" };
+    await mutate(student, "submitQuestion", submitted);
+    await expectReason(() => mutate(student, "deletePersonalItem", { ...remove, id: submitted.id }), "DRAFT_CLOSED");
+});
+
 test("closed question intake preserves draft; referenced outline IDs and personal tombstones are protected", async () => {
     const f = await fixture();
     await join(student, f);

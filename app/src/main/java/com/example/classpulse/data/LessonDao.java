@@ -56,7 +56,7 @@ public interface LessonDao {
     void deleteTopic(TopicRow row);
 
     @Query(
-            "SELECT (SELECT COUNT(*) FROM questions WHERE topicId=:id) + (SELECT COUNT(*) FROM marks WHERE topicId=:id) + (SELECT COUNT(*) FROM reactions WHERE topicId=:id) + (SELECT COUNT(*) FROM topic_visits WHERE topicId=:id) + (SELECT COUNT(*) FROM quizzes WHERE topicId=:id)")
+            "SELECT (SELECT COUNT(*) FROM questions WHERE topicId=:id AND status!='WITHDRAWN') + (SELECT COUNT(*) FROM marks WHERE topicId=:id) + (SELECT COUNT(*) FROM reactions WHERE topicId=:id) + (SELECT COUNT(*) FROM topic_visits WHERE topicId=:id) + (SELECT COUNT(*) FROM quizzes WHERE topicId=:id)")
     int topicReferenceCount(String id);
 
     @Query("SELECT * FROM topic_visits WHERE id=:id")
@@ -82,6 +82,9 @@ public interface LessonDao {
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     long insertReaction(ReactionRow row);
+
+    @Query("DELETE FROM reactions WHERE id=:id")
+    int deleteReaction(String id);
 
     @Upsert
     void saveMark(MarkRow row);
